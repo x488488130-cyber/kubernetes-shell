@@ -850,6 +850,10 @@ init_master() {
     kubeadm token create --print-join-command > "$JOIN_CMD_FILE" 2>/dev/null
     log "Join 命令已保存到: $JOIN_CMD_FILE"
 
+    # 显式加固 Master 污点，确保不调度业务 Pod
+    kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule --overwrite 2>/dev/null || true
+    success "Master 节点已锁定，业务 Pod 不会被调度到此节点"
+
     success "Master 节点初始化完成"
 }
 
@@ -935,6 +939,10 @@ init_master_external_etcd() {
     kubeadm token create --print-join-command > "$JOIN_CMD_FILE" 2>/dev/null
     log "Join 命令已保存到: $JOIN_CMD_FILE"
 
+    # 显式加固 Master 污点，确保不调度业务 Pod
+    kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule --overwrite 2>/dev/null || true
+    success "Master 节点已锁定，业务 Pod 不会被调度到此节点"
+
     success "Master 节点初始化完成 (External etcd)"
 }
 
@@ -999,22 +1007,40 @@ configure_master_mode() {
     case "$mode_choice" in
         1)
             log "纯 Master 模式: Master 节点不调度 Pod"
-            info "Master 节点保持默认，仅运行系统组件"
+            # 加固污点，确保 Master 不可调度
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule --overwrite 2>/dev/null || true
+            log "Master 节点已锁定，仅运行系统组件"
             ;;
         2)
-            log "混合模式: 移除 Master 污点，允许调度 Pod"
-            kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
-            kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
-            success "已移除 Master 污点，允许 Pod 调度到 Master 节点"
+            echo ""
+            echo -e "  ${RED}${BOLD}!!! 警告: 混合模式会让业务 Pod 也能调度到 Master 节点${NC}"
+            echo -e "  ${RED}这可能导致 Master 资源被耗尽，影响集群稳定性！${NC}"
+            echo ""
+            read -rp "  确认移除 Master 污点？输入 YES 继续: " confirm
+            if [ "$confirm" != "YES" ]; then
+                warn "已取消，Master 节点保持不可调度"
+            else
+                log "混合模式: 移除 Master 污点，允许调度 Pod"
+                kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+                kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
+                success "已移除 Master 污点，允许 Pod 调度到 Master 节点"
+            fi
             ;;
         3)
-            log "单节点 All-in-One 模式"
-            kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
-            kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
-            success "单节点 All-in-One 模式: 污点已移除"
-
-            # 对于单节点，配置容忍度使得关键组件可以调度
-            info "提示: 单节点模式下建议配置存储类(如 local-path)以支持 PVC"
+            echo ""
+            echo -e "  ${RED}${BOLD}!!! 警告: 此模式仅适合单节点测试环境！${NC}"
+            echo -e "  ${RED}生产环境请勿使用，会导致 Master 资源竞争！${NC}"
+            echo ""
+            read -rp "  确认移除 Master 污点？输入 YES 继续: " confirm
+            if [ "$confirm" != "YES" ]; then
+                warn "已取消，Master 节点保持不可调度"
+            else
+                log "单节点 All-in-One 模式"
+                kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+                kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
+                success "单节点 All-in-One 模式: 污点已移除"
+                info "提示: 单节点模式下建议配置存储类(如 local-path)以支持 PVC"
+            fi
             ;;
     esac
 }
@@ -1444,7 +1470,8 @@ main() {
             install_k8s_tools
             init_master
             install_cni
-            configure_master_mode
+            # 非交互模式：默认纯 Master，不调度业务 Pod
+            log "默认纯 Master 模式: Master 仅管理，不调度业务 Pod"
             check_cluster_status
             print_summary
             ;;
@@ -1462,7 +1489,8 @@ main() {
             install_k8s_tools
             init_master_external_etcd
             install_cni
-            configure_master_mode
+            # 非交互模式：默认纯 Master，不调度业务 Pod
+            log "默认纯 Master 模式: Master 仅管理，不调度业务 Pod"
             check_cluster_status
             print_summary
             ;;
