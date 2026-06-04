@@ -11,13 +11,17 @@ set -euo pipefail
 #   - 镜像加速代理配置
 #   - kubeadm/kubelet/kubectl 安装
 #   - 网络插件选择 (Calico / Flannel / Cilium / Weave)
+#   - External etcd 集群独立部署 / 内嵌 etcd 两种模式
 #   - 主节点 / 工作节点 / 单节点(All-in-One) 模式
+#   - HA 高可用 Control Plane Endpoint 支持
 #   - 主节点污点移除 (允许 Master 调度 Pod)
 #
 # 用法:
 #   bash k8s-deploy.sh                # 交互式菜单
-#   bash k8s-deploy.sh init           # 一键初始化主节点（非交互）
-#   bash k8s-deploy.sh join           # 一键加入工作节点（非交互，需提供 join 命令）
+#   bash k8s-deploy.sh init           # 一键初始化主节点（内嵌 etcd, 非交互）
+#   bash k8s-deploy.sh init-external  # 一键初始化主节点（外部 etcd, 非交互）
+#   bash k8s-deploy.sh etcd           # 部署外部 etcd 集群
+#   bash k8s-deploy.sh join           # 一键加入工作节点（非交互）
 #   bash k8s-deploy.sh allinone       # 单节点 All-in-One 部署
 # =============================================================================
 
@@ -43,6 +47,14 @@ CONTAINERD_VERSION=""
 MASTER_IP=""
 CONTROL_PLANE_ENDPOINT=""
 NODE_NAME=""
+
+# ------------------------------ etcd 全局变量 -----------------------------------
+ETCD_VERSION="3.5.10"
+ETCD_ENDPOINTS=""
+ETCD_DATA_DIR="/var/lib/etcd"
+ETCD_CLUSTER_MODE="single"
+ETCD_INITIAL_CLUSTER=""
+ETCD_NODES=()
 
 # ------------------------------ 工具函数 --------------------------------------
 log()   { echo -e "$(date '+%Y-%m-%d %H:%M:%S') [INFO]  $*" | tee -a "$LOG_FILE"; }
@@ -307,6 +319,215 @@ configure_image_proxy() {
     fi
 
     success "镜像加速/代理配置完成"
+}
+
+# ------------------------------ etcd 集群配置交互 --------------------------------
+configure_etcd_cluster() {
+    info "========== etcd 集群配置 =========="
+
+    echo ""
+    echo -e "  ${BOLD}etcd 部署模式:${NC}"
+    echo -e "    ${GREEN}1)${NC} 单节点 etcd (本机部署, 与 Master 同节点)"
+    echo -e "    ${GREEN}2)${NC} 多节点 etcd 集群 (至少 3 节点, 推荐独立节点)"
+    echo ""
+
+    local etcd_mode
+    read -rp "  请选择 [1-2, 默认:1]: " etcd_mode
+    etcd_mode="${etcd_mode:-1}"
+
+    read -rp "  etcd 版本 [默认: ${ETCD_VERSION}]: " input_etcd_ver
+    ETCD_VERSION="${input_etcd_ver:-$ETCD_VERSION}"
+
+    local default_ip
+    default_ip="$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}' | xargs -I{} ip -o -4 addr show {} 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+
+    if [ "$etcd_mode" = "1" ]; then
+        ETCD_CLUSTER_MODE="single"
+        local etcd_name_default="${NODE_NAME:-$(hostname)}"
+        read -rp "  本机 etcd 节点名称 [默认: ${etcd_name_default}]: " etcd_name
+        etcd_name="${etcd_name:-$etcd_name_default}"
+        read -rp "  本机 IP [默认: ${default_ip}]: " etcd_ip
+        etcd_ip="${etcd_ip:-$default_ip}"
+        ETCD_ENDPOINTS="https://${etcd_ip}:2379"
+        ETCD_INITIAL_CLUSTER="${etcd_name}=https://${etcd_ip}:2380"
+        ETCD_NODES=("${etcd_name}|${etcd_ip}")
+        log "单节点 etcd 模式, IP: $etcd_ip, 名称: $etcd_name"
+    else
+        ETCD_CLUSTER_MODE="cluster"
+        read -rp "  etcd 集群节点数 [默认: 3]: " etcd_node_count
+        etcd_node_count="${etcd_node_count:-3}"
+
+        ETCD_NODES=()
+        local etcd_endpoints_list=()
+        local etcd_cluster_list=()
+        local this_ip="$default_ip"
+        local this_hostname; this_hostname="$(hostname)"
+
+        for i in $(seq 1 "$etcd_node_count"); do
+            echo ""
+            echo -e "  ${BOLD}--- etcd 节点 $i ---${NC}"
+            read -rp "    节点名称: " etcd_name
+            read -rp "    节点 IP:   " etcd_ip
+
+            ETCD_NODES+=("${etcd_name}|${etcd_ip}")
+            etcd_cluster_list+=("${etcd_name}=https://${etcd_ip}:2380")
+            etcd_endpoints_list+=("https://${etcd_ip}:2379")
+
+            if [ "$etcd_ip" = "$this_ip" ] || [ "$etcd_name" = "$this_hostname" ]; then
+                IS_THIS_ETCD_NODE="true"
+            fi
+        done
+
+        ETCD_INITIAL_CLUSTER="$(IFS=,; echo "${etcd_cluster_list[*]}")"
+        ETCD_ENDPOINTS="$(IFS=,; echo "${etcd_endpoints_list[*]}")"
+
+        log "etcd 集群模式: $etcd_node_count 节点"
+        log "Initial Cluster: $ETCD_INITIAL_CLUSTER"
+        log "Endpoints: $ETCD_ENDPOINTS"
+    fi
+
+    read -rp "  etcd 数据目录 [默认: ${ETCD_DATA_DIR}]: " input_data_dir
+    ETCD_DATA_DIR="${input_data_dir:-$ETCD_DATA_DIR}"
+
+    success "etcd 集群配置完成"
+}
+
+# ------------------------------ 部署 etcd ---------------------------------------
+deploy_etcd() {
+    info "========== 部署 External etcd =========="
+
+    ETCD_VER="v${ETCD_VERSION}"
+    local etcd_download_url
+
+    if [ "$ARCH_TYPE" = "arm64" ]; then
+        etcd_download_url="https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-arm64.tar.gz"
+    else
+        etcd_download_url="https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz"
+    fi
+
+    if [ ! -f /usr/local/bin/etcd ]; then
+        info "下载 etcd ${ETCD_VER}..."
+        curl -sSL "$etcd_download_url" -o /tmp/etcd.tar.gz
+        tar xzf /tmp/etcd.tar.gz -C /tmp/
+        mv "/tmp/etcd-${ETCD_VER}-linux-${ARCH_TYPE}/etcd" /usr/local/bin/
+        mv "/tmp/etcd-${ETCD_VER}-linux-${ARCH_TYPE}/etcdctl" /usr/local/bin/
+        mv "/tmp/etcd-${ETCD_VER}-linux-${ARCH_TYPE}/etcdutl" /usr/local/bin/ 2>/dev/null || true
+        chmod +x /usr/local/bin/etcd /usr/local/bin/etcdctl
+        rm -rf /tmp/etcd.tar.gz "/tmp/etcd-${ETCD_VER}-linux-${ARCH_TYPE}"
+        success "etcd 二进制安装完成"
+    else
+        log "etcd 已安装: $(etcd --version 2>/dev/null | head -1)"
+    fi
+
+    info "生成 etcd TLS 证书..."
+    mkdir -p /etc/kubernetes/pki/etcd
+
+    if [ -f /etc/kubernetes/pki/etcd/ca.crt ]; then
+        log "etcd CA 证书已存在, 跳过生成"
+    else
+        kubeadm init phase certs etcd-ca 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    kubeadm init phase certs etcd-server 2>&1 | tee -a "$LOG_FILE" || true
+    kubeadm init phase certs etcd-peer 2>&1 | tee -a "$LOG_FILE" || true
+    kubeadm init phase certs etcd-healthcheck-client 2>&1 | tee -a "$LOG_FILE" || true
+    kubeadm init phase certs apiserver-etcd-client 2>&1 | tee -a "$LOG_FILE" || true
+
+    success "etcd 证书生成完成"
+
+    if ! id etcd &>/dev/null; then
+        useradd -r -s /sbin/nologin etcd 2>/dev/null || true
+    fi
+    mkdir -p "$ETCD_DATA_DIR"
+    chown -R etcd:etcd "$ETCD_DATA_DIR" /etc/kubernetes/pki/etcd
+
+    local this_ip
+    this_ip="$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}' | xargs -I{} ip -o -4 addr show {} 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+    local this_hostname; this_hostname="$(hostname)"
+
+    local this_etcd_name="${this_hostname}"
+    for node_info in "${ETCD_NODES[@]}"; do
+        local n_name="${node_info%%|*}"
+        local n_ip="${node_info##*|}"
+        if [ "$n_ip" = "$this_ip" ] || [ "$n_name" = "$this_hostname" ]; then
+            this_etcd_name="$n_name"
+            break
+        fi
+    done
+
+    info "配置 etcd systemd 服务..."
+
+    cat > /etc/systemd/system/etcd.service <<ETCD_SERVICE_EOF
+[Unit]
+Description=etcd - highly-available key-value store
+Documentation=https://etcd.io/docs
+After=network.target
+
+[Service]
+Type=notify
+User=etcd
+Group=etcd
+ExecStart=/usr/local/bin/etcd \\
+  --name=${this_etcd_name} \\
+  --data-dir=${ETCD_DATA_DIR} \\
+  --listen-client-urls=https://${this_ip}:2379,https://127.0.0.1:2379 \\
+  --listen-peer-urls=https://${this_ip}:2380 \\
+  --advertise-client-urls=https://${this_ip}:2379 \\
+  --initial-advertise-peer-urls=https://${this_ip}:2380 \\
+  --initial-cluster=${ETCD_INITIAL_CLUSTER} \\
+  --initial-cluster-state=new \\
+  --initial-cluster-token=k8s-etcd-cluster \\
+  --cert-file=/etc/kubernetes/pki/etcd/server.crt \\
+  --key-file=/etc/kubernetes/pki/etcd/server.key \\
+  --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt \\
+  --peer-key-file=/etc/kubernetes/pki/etcd/peer.key \\
+  --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \\
+  --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \\
+  --client-cert-auth=true \\
+  --peer-client-cert-auth=true \\
+  --auto-compaction-retention=1 \\
+  --snapshot-count=10000 \\
+  --quota-backend-bytes=8589934592
+Restart=always
+RestartSec=10s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+ETCD_SERVICE_EOF
+
+    systemctl daemon-reload
+    run_cmd "启动 etcd" systemctl enable --now etcd
+
+    info "等待 etcd 就绪..."
+    sleep 2
+    local etcd_ready=false
+    for i in $(seq 1 30); do
+        if ETCDCTL_API=3 /usr/local/bin/etcdctl \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+            --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+            endpoint health 2>/dev/null | grep -q 'is healthy'; then
+            success "etcd 已就绪"
+            etcd_ready=true
+            break
+        fi
+        sleep 2
+    done
+
+    if [ "$etcd_ready" = false ]; then
+        warn "etcd 启动后未检测到健康状态, 请检查: systemctl status etcd"
+    fi
+
+    cat > /etc/profile.d/etcd.sh <<'EOF'
+export ETCDCTL_API=3
+export ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt
+export ETCDCTL_CERT=/etc/kubernetes/pki/etcd/healthcheck-client.crt
+export ETCDCTL_KEY=/etc/kubernetes/pki/etcd/healthcheck-client.key
+alias ectl='etcdctl'
+EOF
+
+    success "etcd 部署完成"
 }
 
 # ------------------------------ 容器运行时 (containerd) -------------------------
@@ -632,6 +853,91 @@ init_master() {
     success "Master 节点初始化完成"
 }
 
+# ------------------------------ 使用外部 etcd 初始化 Master -----------------------
+init_master_external_etcd() {
+    info "========== 主节点初始化 (External etcd) =========="
+
+    local default_iface; default_iface="$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')"
+    local default_ip; default_ip="$(ip -o -4 addr show "$default_iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+
+    echo ""
+    log "检测到默认网卡: $default_iface, IP: $default_ip"
+
+    read -rp "  请输入 Master 节点 IP [默认: $default_ip]: " MASTER_IP
+    MASTER_IP="${MASTER_IP:-$default_ip}"
+
+    if [ -n "${ETCD_ENDPOINTS:-}" ]; then
+        log "使用已配置的 etcd endpoints: $ETCD_ENDPOINTS"
+        read -rp "  确认 etcd endpoints [${ETCD_ENDPOINTS}]: " input_endpoints
+        ETCD_ENDPOINTS="${input_endpoints:-$ETCD_ENDPOINTS}"
+    else
+        read -rp "  请输入 etcd endpoints (例: https://10.0.0.1:2379,https://10.0.0.2:2379,https://10.0.0.3:2379): " ETCD_ENDPOINTS
+        if [ -z "$ETCD_ENDPOINTS" ]; then
+            die "etcd endpoints 不能为空"
+        fi
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}HA 高可用配置 (可选):${NC}"
+    read -rp "  是否需要配置 Control Plane Endpoint (多 Master/负载均衡)? [y/N]: " ha_setup
+    if [[ "$ha_setup" =~ ^[Yy]$ ]]; then
+        read -rp "  请输入 Control Plane Endpoint (域名或 VIP, 例: k8s-api.example.com:6443): " CONTROL_PLANE_ENDPOINT
+        log "Control Plane Endpoint: $CONTROL_PLANE_ENDPOINT"
+    fi
+
+    read -rp "  请输入 K8s 版本 [默认: ${K8S_VERSION}]: " input_ver
+    K8S_VERSION="${input_ver:-$K8S_VERSION}"
+
+    read -rp "  请输入节点名称 [默认: 自动]: " NODE_NAME
+    if [ -n "$NODE_NAME" ]; then
+        hostnamectl set-hostname "$NODE_NAME" 2>/dev/null || true
+        log "节点名称设置为: $NODE_NAME"
+    fi
+
+    info "预拉取 K8s 组件镜像..."
+    if [ -n "${K8S_MIRROR:-}" ]; then
+        kubeadm config images pull \
+            --kubernetes-version "v${K8S_VERSION}" \
+            --image-repository "$K8S_MIRROR" 2>&1 | tee -a "$LOG_FILE"
+    else
+        kubeadm config images pull \
+            --kubernetes-version "v${K8S_VERSION}" 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    local init_args=(
+        "--kubernetes-version=v${K8S_VERSION}"
+        "--pod-network-cidr=${POD_CIDR}"
+        "--service-cidr=${SERVICE_CIDR}"
+        "--apiserver-advertise-address=${MASTER_IP}"
+        "--external-etcd-endpoints=${ETCD_ENDPOINTS}"
+        "--cri-socket=unix:///run/containerd/containerd.sock"
+    )
+
+    if [ -n "${K8S_MIRROR:-}" ]; then
+        init_args+=("--image-repository=${K8S_MIRROR}")
+    fi
+
+    if [ -n "${CONTROL_PLANE_ENDPOINT:-}" ]; then
+        init_args+=("--control-plane-endpoint=${CONTROL_PLANE_ENDPOINT}")
+    fi
+
+    info "执行 kubeadm init (External etcd)..."
+    log "参数: ${init_args[*]}"
+    kubeadm init "${init_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+
+    info "配置 kubectl..."
+    mkdir -p "$HOME/.kube"
+    cp -f /etc/kubernetes/admin.conf "$HOME/.kube/config"
+    chown "$(id -u):$(id -g)" "$HOME/.kube/config" 2>/dev/null || true
+    mkdir -p /root/.kube
+    cp -f /etc/kubernetes/admin.conf /root/.kube/config
+
+    kubeadm token create --print-join-command > "$JOIN_CMD_FILE" 2>/dev/null
+    log "Join 命令已保存到: $JOIN_CMD_FILE"
+
+    success "Master 节点初始化完成 (External etcd)"
+}
+
 # ------------------------------ 安装网络插件 ------------------------------------
 install_cni() {
     info "========== 安装 CNI 网络插件 =========="
@@ -883,6 +1189,47 @@ check_cluster_status() {
     success "集群状态检查完成"
 }
 
+# ------------------------------ etcd 集群健康检查 --------------------------------
+etcd_health_check() {
+    info "========== etcd 集群健康检查 =========="
+    echo ""
+
+    if ! command -v etcdctl &>/dev/null; then
+        warn "etcdctl 未安装, 无法检查 etcd 健康状态"
+        return
+    fi
+
+    local etcd_endpoints="${ETCD_ENDPOINTS:-https://127.0.0.1:2379}"
+
+    log "etcd 成员列表:"
+    ETCDCTL_API=3 etcdctl \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+        --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+        --endpoints="$etcd_endpoints" \
+        member list 2>/dev/null || warn "无法获取 etcd 成员列表"
+
+    echo ""
+    log "etcd 节点健康状态:"
+    ETCDCTL_API=3 etcdctl \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+        --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+        --endpoints="$etcd_endpoints" \
+        endpoint health 2>/dev/null || warn "无法获取 etcd 健康状态"
+
+    echo ""
+    log "etcd 集群状态:"
+    ETCDCTL_API=3 etcdctl \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+        --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+        --endpoints="$etcd_endpoints" \
+        endpoint status --write-out=table 2>/dev/null || warn "无法获取 etcd 状态"
+
+    success "etcd 健康检查完成"
+}
+
 # ------------------------------ 打印完成信息 ------------------------------------
 print_summary() {
     echo ""
@@ -898,19 +1245,27 @@ print_summary() {
     echo -e "    Pod CIDR:      ${GREEN}${POD_CIDR}${NC}"
     echo -e "    Service CIDR:  ${GREEN}${SERVICE_CIDR}${NC}"
     echo -e "    容器运行时:    ${GREEN}containerd${NC}"
+    if [ -n "${ETCD_ENDPOINTS:-}" ]; then
+        echo -e "    etcd 模式:     ${GREEN}External${NC}"
+        echo -e "    etcd 端点:     ${GREEN}${ETCD_ENDPOINTS}${NC}"
+    else
+        echo -e "    etcd 模式:     ${GREEN}内嵌 (Stacked)${NC}"
+    fi
     echo ""
     echo -e "  ${BOLD}常用命令:${NC}"
     echo -e "    查看节点:      kubectl get nodes -o wide"
     echo -e "    查看 Pod:      kubectl get pods -A"
     echo -e "    查看服务:      kubectl get svc -A"
+    echo -e "    查看 etcd:     etcdctl member list"
     echo -e "    Join 命令:     cat ${JOIN_CMD_FILE}"
     echo -e "    部署日志:      ${LOG_FILE}"
     echo ""
 
     if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
         echo -e "  ${YELLOW}提示:${NC} 请确保安全组/防火墙已开放以下端口:"
-        echo -e "    Master: 6443, 2379-2380, 10250, 10251, 10252, 10259, 10257"
+        echo -e "    Master: 6443, 2379-2380, 10250, 10257, 10259"
         echo -e "    Worker: 10250, 30000-32767 (NodePort)"
+        echo -e "    etcd:   2379-2380"
     fi
 
     if [ "$OS_TYPE" = "redhat" ]; then
@@ -928,20 +1283,22 @@ interactive_menu() {
         banner
         echo -e "  ${BOLD}请选择部署模式:${NC}"
         echo ""
-        echo -e "  ${GREEN}1)${NC} 初始化 Master 节点 (含网络插件 + 组件选择)"
-        echo -e "  ${GREEN}2)${NC} 加入 Worker 节点"
-        echo -e "  ${GREEN}3)${NC} 加入 Control Plane 节点 (多 Master HA)"
-        echo -e "  ${GREEN}4)${NC} 单节点 All-in-One 部署 (Master+Worker)"
-        echo -e "  ${GREEN}5)${NC} 仅检查集群状态"
-        echo -e "  ${GREEN}6)${NC} 重置节点 (kubeadm reset)"
-        echo -e "  ${GREEN}7)${NC} 退出"
+        echo -e "  ${GREEN}1)${NC} 初始化 Master 节点 (内嵌 etcd, 含网络插件 + 组件选择)"
+        echo -e "  ${GREEN}2)${NC} 初始化 Master 节点 (外部 etcd, 需已有 etcd 集群)"
+        echo -e "  ${GREEN}3)${NC} 部署 External etcd 集群"
+        echo -e "  ${GREEN}4)${NC} 加入 Worker 节点"
+        echo -e "  ${GREEN}5)${NC} 加入 Control Plane 节点 (多 Master HA)"
+        echo -e "  ${GREEN}6)${NC} 单节点 All-in-One 部署 (内嵌 etcd, Master+Worker)"
+        echo -e "  ${GREEN}7)${NC} 检查集群状态"
+        echo -e "  ${GREEN}8)${NC} etcd 集群健康检查"
+        echo -e "  ${GREEN}9)${NC} 重置节点 (kubeadm reset + etcd 清理)"
+        echo -e "  ${GREEN}10)${NC} 退出"
         echo ""
 
-        read -rp "  请输入选项 [1-7]: " action_choice
+        read -rp "  请输入选项 [1-10]: " action_choice
 
         case "$action_choice" in
             1)
-                # 完整 Master 节点部署
                 detect_os
                 system_check
                 configure_image_proxy
@@ -958,7 +1315,34 @@ interactive_menu() {
                 break
                 ;;
             2)
-                # Worker 节点
+                detect_os
+                system_check
+                configure_image_proxy
+                system_init
+                install_containerd
+                select_cni_plugin
+                install_k8s_tools
+                init_master_external_etcd
+                install_cni
+                configure_master_mode
+                install_addons
+                check_cluster_status
+                print_summary
+                break
+                ;;
+            3)
+                detect_os
+                system_check
+                configure_image_proxy
+                system_init
+                install_k8s_tools
+                configure_etcd_cluster
+                deploy_etcd
+                etcd_health_check
+                print_summary
+                break
+                ;;
+            4)
                 detect_os
                 system_check
                 configure_image_proxy
@@ -969,8 +1353,7 @@ interactive_menu() {
                 check_cluster_status
                 break
                 ;;
-            3)
-                # Control Plane 节点
+            5)
                 detect_os
                 system_check
                 configure_image_proxy
@@ -981,8 +1364,7 @@ interactive_menu() {
                 check_cluster_status
                 break
                 ;;
-            4)
-                # All-in-One
+            6)
                 detect_os
                 system_check
                 configure_image_proxy
@@ -992,7 +1374,6 @@ interactive_menu() {
                 install_k8s_tools
                 init_master
                 install_cni
-                # 直接设为单节点模式
                 kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
                 kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
                 install_addons
@@ -1000,21 +1381,32 @@ interactive_menu() {
                 print_summary
                 break
                 ;;
-            5)
+            7)
                 detect_os
                 check_cluster_status
                 break
                 ;;
-            6)
+            8)
+                detect_os
+                etcd_health_check
+                break
+                ;;
+            9)
                 info "正在重置节点..."
+                systemctl stop etcd 2>/dev/null || true
+                systemctl disable etcd 2>/dev/null || true
+                rm -f /etc/systemd/system/etcd.service
+                rm -rf "$ETCD_DATA_DIR" /etc/profile.d/etcd.sh 2>/dev/null || true
+                rm -rf /etc/kubernetes/pki/etcd 2>/dev/null || true
                 kubeadm reset -f 2>&1 | tee -a "$LOG_FILE" || true
                 rm -rf "$HOME/.kube" /root/.kube 2>/dev/null || true
                 iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X 2>/dev/null || true
                 ipvsadm --clear 2>/dev/null || true
+                systemctl daemon-reload
                 success "节点已重置"
                 break
                 ;;
-            7)
+            10)
                 info "退出"
                 exit 0
                 ;;
@@ -1039,7 +1431,6 @@ main() {
 
     case "${1:-menu}" in
         init)
-            # 一键初始化 Master (非交互，使用默认值)
             detect_os
             system_check
             MIRROR_REGISTRY="registry.cn-hangzhou.aliyuncs.com"
@@ -1056,6 +1447,41 @@ main() {
             configure_master_mode
             check_cluster_status
             print_summary
+            ;;
+        init-external)
+            detect_os
+            system_check
+            MIRROR_REGISTRY="registry.cn-hangzhou.aliyuncs.com"
+            MIRROR_ENDPOINT="https://docker.m.daocloud.io"
+            K8S_MIRROR="registry.cn-hangzhou.aliyuncs.com/google_containers"
+            CNI_PLUGIN="calico"
+            POD_CIDR="192.168.0.0/16"
+            CNI_MANIFEST="https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml"
+            system_init
+            install_containerd
+            install_k8s_tools
+            init_master_external_etcd
+            install_cni
+            configure_master_mode
+            check_cluster_status
+            print_summary
+            ;;
+        etcd)
+            detect_os
+            system_check
+            MIRROR_REGISTRY="registry.cn-hangzhou.aliyuncs.com"
+            MIRROR_ENDPOINT="https://docker.m.daocloud.io"
+            K8S_MIRROR="registry.cn-hangzhou.aliyuncs.com/google_containers"
+            system_init
+            install_k8s_tools
+            configure_etcd_cluster
+            deploy_etcd
+            etcd_health_check
+            print_summary
+            ;;
+        etcd-check)
+            detect_os
+            etcd_health_check
             ;;
         join)
             detect_os
@@ -1092,12 +1518,15 @@ main() {
             interactive_menu
             ;;
         *)
-            echo "用法: $0 [init|join|allinone|menu]"
+            echo "用法: $0 [init|init-external|etcd|etcd-check|join|allinone|menu]"
             echo ""
-            echo "  init      - 一键部署 Master 节点 (非交互, 默认 calico + aliyun 镜像)"
-            echo "  join      - 一键加入 Worker 节点 (非交互)"
-            echo "  allinone  - 单节点 All-in-One 部署 (非交互)"
-            echo "  menu      - 交互式菜单 (默认)"
+            echo "  init          - 一键部署 Master 节点 (内嵌 etcd, 非交互, calico + aliyun 镜像)"
+            echo "  init-external - 一键部署 Master 节点 (外部 etcd, 非交互)"
+            echo "  etcd          - 部署 External etcd 集群 (非交互)"
+            echo "  etcd-check    - etcd 集群健康检查"
+            echo "  join          - 一键加入 Worker 节点 (非交互)"
+            echo "  allinone      - 单节点 All-in-One 部署 (内嵌 etcd, 非交互)"
+            echo "  menu          - 交互式菜单 (默认)"
             exit 1
             ;;
     esac
